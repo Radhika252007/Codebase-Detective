@@ -1,5 +1,6 @@
 """State for the Codebase Detective investigation graph."""
-from typing import Annotated, TypedDict
+from typing import Annotated, TypedDict, Literal
+from typing_extensions import NotRequired
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
@@ -12,6 +13,24 @@ class Hypothesis(TypedDict):
     supporting_evidence: list[str]   # "E3: one-sentence reason"
     contradicting_evidence: list[str]
 
+class InitializationConfig(TypedDict):
+    project_root: str
+    inspect_database: bool
+    database_secret_ref: NotRequired[str | None]
+
+DatabaseAccessStatus = Literal[
+    "not_requested",
+    "pending",
+    "ready",
+    "needs_setup",
+    "failed"
+]
+
+ProjectValidationStatus = Literal[
+    "pending",
+    "valid",
+    "invalid"
+]
 
 class EvidenceEntry(TypedDict):
     id: str                          # "E1", "E2", ...
@@ -51,3 +70,21 @@ class InvestigationState(TypedDict):
     final_report: str
 
     messages: Annotated[list[AnyMessage], add_messages]
+
+    # initialization / HITL configuration
+    project_root: NotRequired[str]
+    inspect_database: NotRequired[bool]
+
+    # Reference to credentials stored securely outside graph state
+    database_secret_ref: NotRequired[str | None]
+
+    # validation status
+    project_validation_status: NotRequired[ProjectValidationStatus]
+    database_access_status: NotRequired[DatabaseAccessStatus]
+
+    # human confirmation
+    configuration_confirmed: NotRequired[bool]
+    db_setup_confirmed: NotRequired[bool]
+
+    # initialization errors
+    initialization_error: NotRequired[str]
