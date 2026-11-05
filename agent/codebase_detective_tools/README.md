@@ -19,17 +19,18 @@ Tools report **measurements, never verdicts**; the agent does the diagnosing.
 Retired but still importable: `list_project_files` (the case brief covers layout), `run_explain`, `get_indexes`, `time_endpoint`, `list_api_routes` (needed a manifest script).
 
 ## Setup
-1. `pip install -r requirements.txt`; copy `.env.example` to `.env` (`TARGET_PROJECT_ROOT`, `TARGET_DATABASE_URL`, `TARGET_BASE_URL`, optional `TARGET_AUTH_TOKEN`).
-2. Read-only DB user (the real safety boundary):
+1. `pip install -r requirements.txt`.
+2. Provide `project_root`, `database_url`, `database_tables`, `base_url`, `auth_token`, and `routes_manifest` through per-investigation runtime context. Keep the database password and API token in a secure credential store; do not put them in graph state or HITL responses.
+3. If DB inspection is enabled, configure a dedicated, non-privileged read-only role with grants limited to the configured allowlist:
 ```sql
-CREATE USER detective_ro WITH PASSWORD '...';
+CREATE ROLE detective_ro LOGIN PASSWORD '<set securely>';
 GRANT CONNECT ON DATABASE yourdb TO detective_ro;
-GRANT USAGE ON SCHEMA public TO detective_ro;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO detective_ro;
-GRANT pg_read_all_stats TO detective_ro;   -- lets db_activity / pg_stat_statements see the app's sessions
+GRANT USAGE ON SCHEMA app TO detective_ro;
+GRANT SELECT ON TABLE app.bookings, app.users TO detective_ro;
 ```
-3. Optional, for exact "queries per request": in postgresql.conf set `shared_preload_libraries = 'pg_stat_statements'`, restart, then `CREATE EXTENSION pg_stat_statements;` (superuser).
-4. `python test_tools.py` (edit the names at the top first) and `python case_brief.py`.
+Do not grant ownership, write privileges, broad data roles, or access outside the allowlist. `pg_monitor` and `pg_stat_statements` are optional enhancements; neither is required for basic inspection.
+4. Optional, for exact "queries per request": in postgresql.conf set `shared_preload_libraries = 'pg_stat_statements'`, restart, then `CREATE EXTENSION pg_stat_statements;` (superuser).
+5. Run the offline suite with `python -m unittest discover -s tests -p "test_*.py"`.
 
 ## Known limits
 - `profile_endpoint` takes ~12 s: Postgres publishes table counters up to 10 s late, so it waits once. Counts include any other traffic on the database in that window.

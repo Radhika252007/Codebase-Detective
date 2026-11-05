@@ -3,6 +3,8 @@ import re
 from pathlib import Path
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+from agent.runtime_context import DetectiveContext
 from config import PROJECT_ROOT
 from agent.codebase_detective_tools.tools.file_tools import _resolve_safe_path
 
@@ -38,24 +40,25 @@ _KIND_RANK = {"function": 0, "class": 0, "variable": 0, "exports": 0, "model": 0
               "method": 1, "property": 1}
 
 # Per-call caches: one investigation tool call walks the project once, not once per lookup.
-_FILE_CACHE: dict[str, list[str]] = {}
-_LIST_CACHE: list | None = None
+_FILE_CACHE: dict[tuple[str, str], list[str]] = {}
+_LIST_CACHE: dict[str, list] = {}
 
 
 def reset_caches() -> None:
-    global _LIST_CACHE
     _FILE_CACHE.clear()
-    _LIST_CACHE = None
+    _LIST_CACHE.clear()
 
 
-def _lines(rel: str) -> list[str]:
-    if rel not in _FILE_CACHE:
+def _lines(rel: str, project_root: str = PROJECT_ROOT) -> list[str]:
+    root = str(Path(project_root).resolve())
+    cache_key = (root, rel)
+    if cache_key not in _FILE_CACHE:
         try:
-            _FILE_CACHE[rel] = (Path(PROJECT_ROOT).resolve() / rel).read_text(
+            _FILE_CACHE[cache_key] = (Path(root) / rel).read_text(
                 encoding="utf-8", errors="replace").splitlines()
         except OSError:
-            _FILE_CACHE[rel] = []
-    return _FILE_CACHE[rel]
+            _FILE_CACHE[cache_key] = []
+    return _FILE_CACHE[cache_key]
 
 
 def _js_patterns(n: str):
@@ -149,8 +152,8 @@ def _callees(body: str, own_name: str) -> list[str]:
     return seen
 
 
-def _iter_files():
-    root = Path(PROJECT_ROOT).resolve()
+def _iter_files(project_root: str = PROJECT_ROOT):
+    root = Path(project_root).resolve()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fn in filenames:
@@ -162,7 +165,7 @@ def _iter_files():
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, root)
             try:
-                _resolve_safe_path(rel)        # same sandbox guard as read_file
+                _resolve_safe_path(rel, str(root))        # same sandbox guard as read_file
                 if os.path.getsize(full) > MAX_FILE_BYTES:
                     continue
             except (ValueError, OSError):
@@ -170,11 +173,11 @@ def _iter_files():
             yield rel, ext
 
 
-def _files() -> list:
-    global _LIST_CACHE
-    if _LIST_CACHE is None:
-        _LIST_CACHE = list(_iter_files())
-    return _LIST_CACHE
+def _files(project_root: str = PROJECT_ROOT) -> list:
+    root = str(Path(project_root).resolve())
+    if root not in _LIST_CACHE:
+        _LIST_CACHE[root] = list(_iter_files(root))
+    return _LIST_CACHE[root]
 
 
 def _is_test_path(rel: str) -> bool:
@@ -182,7 +185,12 @@ def _is_test_path(rel: str) -> bool:
     return any(t in r for t in ("/test/", "/tests/", "__tests__", ".test.", ".spec."))
 
 
-def find_definitions(name: str, path_hint: str = "", collect_refs: bool = True):
+def find_definitions(
+    name: str,
+    path_hint: str = "",
+    collect_refs: bool = True,
+    project_root: str = PROJECT_ROOT,
+):
     """
     Shared by view_code_item and function_history.
     Returns (found, refs). found items: (test_penalty, kind_rank, rel, kind, start, end)
@@ -192,10 +200,10 @@ def find_definitions(name: str, path_hint: str = "", collect_refs: bool = True):
     ref_re = re.compile(rf"(?<![\w$]){n}\s*\(")
     hint = path_hint.lower().replace("\\", "/")
     found, refs = [], []
-    for rel, ext in _files():
+    for rel, ext in _files(project_root):
         if hint and hint not in rel.lower().replace("\\", "/"):
             continue
-        lines = _lines(rel)
+        lines = _lines(rel, project_root)
         patterns = _prisma_patterns(n) if ext in PRISMA_EXT else _js_patterns(n)
         i = 0
         while i < len(lines):
@@ -217,9 +225,9 @@ def find_definitions(name: str, path_hint: str = "", collect_refs: bool = True):
     return found, refs
 
 
-def _render(name: str, item, max_lines: int):
+def _render(name: str, item, max_lines: int, project_root: str = PROJECT_ROOT):
     _, _, rel, kind, start, end = item
-    lines = _lines(rel)
+    lines = _lines(rel, project_root)
     total = end - start + 1
     shown_end = min(end, start + max_lines - 1)
     body = "\n".join(f"{k + 1}: {lines[k]}" for k in range(start, shown_end + 1))
@@ -230,7 +238,12 @@ def _render(name: str, item, max_lines: int):
     return header + "\n" + body + ("\nCalls: " + ", ".join(calls) if calls else ""), calls
 
 
-def _follow(root_name: str, callee_names: list[str], depth_limit: int) -> list[str]:
+def _follow(
+    root_name: str,
+    callee_names: list[str],
+    depth_limit: int,
+    project_root: str = PROJECT_ROOT,
+) -> list[str]:
     """Inline definitions of project-defined callees, breadth-first, capped."""
     depth_limit = min(depth_limit, MAX_FOLLOW_DEPTH)
     seen = {root_name}
@@ -244,10 +257,10 @@ def _follow(root_name: str, callee_names: list[str], depth_limit: int) -> list[s
             if cand in seen or cand in _COMMON_METHODS or len(cand) < 3 or not _NAME_RE.match(cand):
                 continue
             seen.add(cand)
-            found, _ = find_definitions(cand, collect_refs=False)
+            found, _ = find_definitions(cand, collect_refs=False, project_root=project_root)
             if not found or len(found) > 2:     # library call, or too ambiguous to guess
                 continue
-            text, subcalls = _render(cand, found[0], FOLLOW_MAX_LINES)
+            text, subcalls = _render(cand, found[0], FOLLOW_MAX_LINES, project_root)
             out.append(f"-- followed from {parent} (depth {depth}) --\n{text}")
             nxt.extend((c, cand) for c in subcalls)
             if len(out) >= MAX_FOLLOWED:
@@ -258,7 +271,13 @@ def _follow(root_name: str, callee_names: list[str], depth_limit: int) -> list[s
 
 
 @tool
-def view_code_item(name: str, path_hint: str = "", max_lines: int = 120, follow: int = 1) -> str:
+def view_code_item(
+    name: str,
+    runtime: ToolRuntime[DetectiveContext],
+    path_hint: str = "",
+    max_lines: int = 120,
+    follow: int = 1,
+) -> str:
     """
     Find a function, class, method, arrow-function variable, or Prisma model
     by NAME anywhere in the target project and return its full implementation
@@ -272,8 +291,11 @@ def view_code_item(name: str, path_hint: str = "", max_lines: int = 120, follow:
     """
     if not _NAME_RE.match(name or ""):
         return "ERROR: name must be a single identifier (letters, digits, _ or $), e.g. 'getOrders'."
+    project_root = runtime.context.project_root if runtime.context else None
+    if not project_root:
+        return "ERROR: no per-investigation project root is configured."
     reset_caches()
-    found, refs = find_definitions(name, path_hint)
+    found, refs = find_definitions(name, path_hint, project_root=project_root)
     if not found:
         return (f"No definition of '{name}' found"
                 f"{' under paths containing ' + repr(path_hint) if path_hint else ''}. "
@@ -282,7 +304,7 @@ def view_code_item(name: str, path_hint: str = "", max_lines: int = 120, follow:
 
     blocks, top_calls = [], []
     for idx, item in enumerate(found[:MAX_ITEMS]):
-        text, calls = _render(name, item, max_lines)
+        text, calls = _render(name, item, max_lines, project_root)
         blocks.append(text)
         if idx == 0:
             top_calls = calls
@@ -295,7 +317,7 @@ def view_code_item(name: str, path_hint: str = "", max_lines: int = 120, follow:
         blocks.append("Called from:\n" + "\n".join(
             f"  {r[0].replace(os.sep, '/')}:{r[1]}: {r[2]}" for r in callers))
 
-    followed = _follow(name, top_calls, follow) if follow > 0 else []
+    followed = _follow(name, top_calls, follow, project_root) if follow > 0 else []
     result = "\n\n".join(blocks + followed)
     while len(result) > MAX_OUTPUT_CHARS and followed:
         followed.pop()                      # drop whole followed items, never cut code mid-line

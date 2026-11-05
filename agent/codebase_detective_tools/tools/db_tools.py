@@ -1,10 +1,12 @@
 import json
 import re
 from contextlib import closing
-import psycopg2
 import sqlparse
 from langchain_core.tools import tool
-from config import DATABASE_URL, MAX_EXPLAIN_CHARS
+from langgraph.prebuilt import ToolRuntime
+from agent.database_access import connect_read_only, parse_database_tables
+from agent.runtime_context import DetectiveContext
+from config import MAX_EXPLAIN_CHARS
 
 _FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|CREATE)\b",
@@ -31,14 +33,39 @@ def _is_select_only(sql: str) -> bool:
     return True
 
 
-def _connect():
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.set_session(readonly=True)
-    return conn
+def _connect(runtime: ToolRuntime[DetectiveContext] | None = None):
+    context = runtime.context if runtime is not None else None
+    if context is None:
+        raise RuntimeError("No per-investigation database runtime is available.")
+    if not runtime.state.get("inspect_database", False):
+        raise RuntimeError("Database inspection is disabled for this investigation.")
+    if runtime.state.get("database_access_status") != "ready":
+        raise RuntimeError("Database access has not passed validation.")
+
+    return connect_read_only(context.database_url, context.database_tables)
+
+
+def _resolve_scoped_table(
+    table_name: str,
+    database_tables: tuple[str, ...],
+) -> tuple[str, str] | None:
+    if not isinstance(table_name, str):
+        return None
+    try:
+        allowed_tables = parse_database_tables(database_tables)
+    except ValueError:
+        return None
+    if "." in table_name:
+        schema_name, relation_name = table_name.split(".", 1)
+        candidate = (schema_name, relation_name)
+        return candidate if candidate in allowed_tables else None
+
+    matches = [table for table in allowed_tables if table[1] == table_name]
+    return matches[0] if len(matches) == 1 else None
 
 
 @tool
-def run_explain(sql: str) -> str:
+def run_explain(sql: str, runtime: ToolRuntime[DetectiveContext]) -> str:
     """
     Run EXPLAIN (ANALYZE, BUFFERS) on a read-only SELECT query against the
     target database and return the query plan as text. Use this to check
@@ -51,19 +78,22 @@ def run_explain(sql: str) -> str:
         return "ERROR: only a single read-only SELECT statement is allowed."
 
     try:
-        with closing(_connect()) as conn:
+        with closing(_connect(runtime)) as conn:
             with conn.cursor() as cur:
                 cur.execute(f"EXPLAIN (ANALYZE, BUFFERS) {sql}")
                 rows = cur.fetchall()
     except Exception as e:
-        return f"ERROR running EXPLAIN: {e}"
+        return f"ERROR running EXPLAIN: {type(e).__name__}"
 
     plan = "\n".join(row[0] for row in rows)
     return plan[:MAX_EXPLAIN_CHARS]
 
 
 @tool
-def get_indexes(table_name: str) -> str:
+def get_indexes(
+    table_name: str,
+    runtime: ToolRuntime[DetectiveContext],
+) -> str:
     """
     List the indexes that exist on a given table in the target database
     (table_name should match the actual Postgres table name, e.g. 'Order'
@@ -71,22 +101,30 @@ def get_indexes(table_name: str) -> str:
     sequential scan, to check whether the filtered column actually has an
     index.
     """
+    context = runtime.context
+    scoped_table = _resolve_scoped_table(table_name, context.database_tables)
+    if scoped_table is None:
+        return "ERROR: table is not in the configured database allowlist."
+    schema_name, relation_name = scoped_table
     query = """
         SELECT indexname, indexdef
         FROM pg_indexes
-        WHERE tablename = %s
+        WHERE schemaname = %s AND tablename = %s
         ORDER BY indexname;
     """
     try:
-        with closing(_connect()) as conn:
+        with closing(_connect(runtime)) as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (table_name,))
+                cur.execute(query, (schema_name, relation_name))
                 rows = cur.fetchall()
     except Exception as e:
-        return f"ERROR fetching indexes: {e}"
+        return f"ERROR fetching indexes: {type(e).__name__}"
 
     if not rows:
-        return f"No indexes found on table '{table_name}' (check the exact table name -- Prisma/Postgres names are case-sensitive)."
+        return (
+            f"No indexes found on table '{schema_name}.{relation_name}' "
+            "(check the exact PostgreSQL table name)."
+        )
 
     return "\n".join(f"{name}: {definition}" for name, definition in rows)
 
@@ -106,7 +144,11 @@ def _short(s, n=90):
 
 
 @tool
-def explain_query(sql: str, raw: bool = False) -> str:
+def explain_query(
+    sql: str,
+    runtime: ToolRuntime[DetectiveContext],
+    raw: bool = False,
+) -> str:
     """
     Run EXPLAIN (ANALYZE, BUFFERS) on a single read-only SELECT and return a
     compact summary instead of raw plan text: execution/planning time, one
@@ -119,13 +161,13 @@ def explain_query(sql: str, raw: bool = False) -> str:
     if not _is_select_only(sql):
         return "ERROR: only a single read-only SELECT statement is allowed."
     try:
-        with closing(_connect()) as conn:
+        with closing(_connect(runtime)) as conn:
             with conn.cursor() as cur:
                 cur.execute("SET LOCAL statement_timeout = '15s'")
                 cur.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")
                 data = cur.fetchone()[0]
     except Exception as e:
-        return f"ERROR running EXPLAIN: {e}"
+        return f"ERROR running EXPLAIN: {type(e).__name__}"
     if isinstance(data, str):
         data = json.loads(data)
     root = data[0]

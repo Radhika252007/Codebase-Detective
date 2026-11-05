@@ -9,6 +9,7 @@ gate, step limit, call/result pairing, duplicate skipping, history trimming). It
 tell you how well Gemini reasons; that is what a planted-bug harness measures.
 """
 import itertools
+import importlib
 import os
 import sys
 import types
@@ -26,7 +27,7 @@ _genai.ChatGoogleGenerativeAI = lambda **kw: _Dummy()
 sys.modules["langchain_google_genai"] = _genai
 
 _brief = types.ModuleType("case_brief")
-_brief.build_case_brief = lambda: "BRIEF: Express + Prisma; table Order has no index besides its primary key"
+_brief.build_case_brief = lambda **_: "BRIEF: Express + Prisma; table Order has no index besides its primary key"
 sys.modules["case_brief"] = _brief
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
@@ -78,6 +79,10 @@ sys.modules["agent.codebase_detective_tools"] = _pkg
 sys.modules["agent.codebase_detective_tools.tools"] = _mod
 
 from agent import graph, nodes  # noqa: E402
+_collect_configuration_module = importlib.import_module("agent.nodes.collect_configuration")
+_configuration_confirmation_module = importlib.import_module(
+    "agent.nodes.configuration_confirmation"
+)
 
 
 # ---- a scripted fake model ----
@@ -128,6 +133,11 @@ def install(script):
     nodes.llm = fake
     nodes.llm_with_tools = fake.bind_tools(None)
     nodes._tools_by_name = {t.name: t for t in FAKE_TOOLS}
+    _collect_configuration_module.interrupt = lambda _: {
+        "project_root": os.getcwd(),
+        "inspect_database": False,
+    }
+    _configuration_confirmation_module.interrupt = lambda _: True
     return fake
 
 

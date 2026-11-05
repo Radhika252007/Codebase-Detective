@@ -32,6 +32,12 @@ ProjectValidationStatus = Literal[
     "invalid"
 ]
 
+InitializationStatus = Literal[
+    "pending",
+    "confirmed",
+    "error"
+]
+
 class EvidenceEntry(TypedDict):
     id: str                          # "E1", "E2", ...
     tool: str
@@ -85,6 +91,8 @@ class InvestigationState(TypedDict):
     # human confirmation
     configuration_confirmed: NotRequired[bool]
     db_setup_confirmed: NotRequired[bool]
+    db_setup_attempts: NotRequired[int]
 
     # initialization errors
     initialization_error: NotRequired[str]
+    initialization_status: NotRequired[InitializationStatus]

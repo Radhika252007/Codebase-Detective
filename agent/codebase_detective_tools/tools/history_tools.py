@@ -1,9 +1,10 @@
 import os
-import re
 import subprocess
 from pathlib import Path
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+from agent.runtime_context import DetectiveContext
 
 from config import PROJECT_ROOT
 from .code_item_tools import _NAME_RE, find_definitions, reset_caches
@@ -12,14 +13,19 @@ MAX_OUTPUT_CHARS = 6000
 MAX_DIFF_LINES_PER_COMMIT = 25
 
 
-def _git(args: list[str], timeout: int = 20):
-    r = subprocess.run(["git", "-C", str(Path(PROJECT_ROOT).resolve())] + args,
+def _git(args: list[str], project_root: str = PROJECT_ROOT, timeout: int = 20):
+    r = subprocess.run(["git", "-C", str(Path(project_root).resolve())] + args,
                        capture_output=True, text=True, timeout=timeout)
     return r.returncode, r.stdout, r.stderr.strip()
 
 
 @tool
-def function_history(name: str, path_hint: str = "", max_commits: int = 5) -> str:
+def function_history(
+    name: str,
+    runtime: ToolRuntime[DetectiveContext],
+    path_hint: str = "",
+    max_commits: int = 5,
+) -> str:
     """
     Show how a function/class/method has changed over time: finds its current
     line range, then returns the commits that touched exactly those lines
@@ -29,24 +35,33 @@ def function_history(name: str, path_hint: str = "", max_commits: int = 5) -> st
     """
     if not _NAME_RE.match(name or ""):
         return "ERROR: name must be a single identifier, e.g. 'getOrders'."
+    project_root = runtime.context.project_root if runtime.context else None
+    if not project_root:
+        return "ERROR: no per-investigation project root is configured."
     max_commits = max(1, min(int(max_commits), 10))
     reset_caches()
-    found, _ = find_definitions(name, path_hint, collect_refs=False)
+    found, _ = find_definitions(
+        name,
+        path_hint,
+        collect_refs=False,
+        project_root=project_root,
+    )
     if not found:
         return f"No definition of '{name}' found, so there is no line range to trace."
     _, _, rel, kind, start, end = found[0]
     relp = rel.replace(os.sep, "/")
 
     try:
-        code, _, err = _git(["rev-parse", "--is-inside-work-tree"])
+        code, _, err = _git(["rev-parse", "--is-inside-work-tree"], project_root)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"ERROR: git is not usable here ({type(e).__name__})."
     if code != 0:
         return f"ERROR: the project is not inside a git repository ({err[:100]})."
 
-    status = _git(["status", "--porcelain", "--", relp])[1].strip()
+    status = _git(["status", "--porcelain", "--", relp], project_root)[1].strip()
     code, out, err = _git(["log", f"-L{start + 1},{end + 1}:{relp}", "-n", str(max_commits),
-                           "--no-color", "--date=short", "--pretty=format:COMMIT|%h|%ad|%an|%s"], timeout=30)
+                           "--no-color", "--date=short", "--pretty=format:COMMIT|%h|%ad|%an|%s"],
+                          project_root, timeout=30)
     if code != 0:
         return f"ERROR from git log -L: {err[:200]}"
 

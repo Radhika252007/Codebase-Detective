@@ -1,11 +1,18 @@
+import os
 import subprocess
 from pathlib import Path
 from langchain_core.tools import tool
-from config import PROJECT_ROOT, MAX_SEARCH_RESULTS
+from langgraph.prebuilt import ToolRuntime
+from agent.runtime_context import DetectiveContext
+from config import MAX_SEARCH_RESULTS
 
 
 @tool
-def search_code(pattern: str, file_glob: str = "*.js") -> str:
+def search_code(
+    pattern: str,
+    runtime: ToolRuntime[DetectiveContext],
+    file_glob: str = "*.js",
+) -> str:
     """
     Search the target project's source code for a text pattern (plain text
     or simple regex), e.g. 'findMany', 'include:', 'for \\(' or a function
@@ -15,7 +22,10 @@ def search_code(pattern: str, file_glob: str = "*.js") -> str:
     '*.prisma'. Use this when you have an idea of what you're looking for
     but not which file it's in.
     """
-    root = Path(PROJECT_ROOT).resolve()
+    project_root = runtime.context.project_root if runtime.context else None
+    if not project_root:
+        return "ERROR: no per-investigation project root is configured."
+    root = Path(project_root).resolve()
     try:
         result = subprocess.run(
             [
@@ -38,7 +48,11 @@ def search_code(pattern: str, file_glob: str = "*.js") -> str:
         return "No matches found."
 
     shown = lines[:MAX_SEARCH_RESULTS]
-    relative = [line.replace(str(root) + "/", "") for line in shown]
+    root_prefixes = (str(root) + os.sep, str(root) + "/")
+    relative = [
+        next((line[len(prefix):] for prefix in root_prefixes if line.startswith(prefix)), line)
+        for line in shown
+    ]
 
     out = "\n".join(relative)
     if len(lines) > MAX_SEARCH_RESULTS:

@@ -1,9 +1,12 @@
 from contextlib import closing
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 from psycopg2 import sql
 
-from .db_tools import _connect
+from agent.database_access import parse_database_tables
+from agent.runtime_context import DetectiveContext
+from .db_tools import _connect, _resolve_scoped_table
 
 COUNT_CAP = 100_000
 
@@ -20,13 +23,18 @@ def _when(v) -> str:
     return str(v)[:16] if v else "never"
 
 
-def _rows_text(cur, relname: str, live: int, est: int) -> str:
+def _rows_text(cur, schema_name: str, relname: str, live: int, est: int) -> str:
     if live and live > 0:
         return f"~{live:,} rows (stats estimate)"
     if est and est > 0:
         return f"~{est:,} rows (planner estimate)"
-    cur.execute(sql.SQL("SELECT count(*) FROM (SELECT 1 FROM {} LIMIT %s) s")
-                .format(sql.Identifier(relname)), (COUNT_CAP,))
+    cur.execute(
+        sql.SQL("SELECT count(*) FROM (SELECT 1 FROM {}.{} LIMIT %s) s").format(
+            sql.Identifier(schema_name),
+            sql.Identifier(relname),
+        ),
+        (COUNT_CAP,),
+    )
     n = cur.fetchone()[0]
     return f"{n:,}{'+' if n >= COUNT_CAP else ''} rows (counted)"
 
@@ -42,7 +50,10 @@ _COLS = ("(SELECT string_agg(a.attname, ',' ORDER BY k.ord) "
 
 
 @tool
-def inspect_table(table_name: str) -> str:
+def inspect_table(
+    table_name: str,
+    runtime: ToolRuntime[DetectiveContext],
+) -> str:
     """
     Everything useful about ONE table in a single call: row count, table and
     index sizes, every index with its size and how many times it has been
@@ -51,23 +62,29 @@ def inspect_table(table_name: str) -> str:
     statistics (distinct values, null share) from ANALYZE. Use the exact
     Postgres table name (Prisma models keep their case, e.g. 'Order').
     """
-    if not table_name or len(table_name) > 63:
-        return "ERROR: give a table name (max 63 characters)."
+    scoped_table = _resolve_scoped_table(table_name, runtime.context.database_tables)
+    if scoped_table is None:
+        return "ERROR: table is not in the configured database allowlist."
+    schema_name, relation_name = scoped_table
     try:
-        with closing(_connect()) as conn, conn.cursor() as cur:
+        with closing(_connect(runtime)) as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT c.oid, c.relname, c.reltuples::bigint,
                        pg_relation_size(c.oid), pg_indexes_size(c.oid)
                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
-                  AND lower(c.relname) = lower(%s)
-                ORDER BY (c.relname = %s) DESC LIMIT 1""", (table_name, table_name))
+                WHERE n.nspname = %s AND c.relkind IN ('r', 'p')
+                  AND c.relname = %s
+                LIMIT 1""", (schema_name, relation_name))
             row = cur.fetchone()
             if not row:
                 names = [r[0] for r in _colset(cur, """
                     SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY 1 LIMIT 40""", None)]
-                return f"ERROR: no table '{table_name}'. Tables in public: {', '.join(names)}"
+                    WHERE n.nspname = %s AND c.relkind IN ('r', 'p') ORDER BY 1 LIMIT 40""",
+                    (schema_name,))]
+                return (
+                    f"ERROR: no table '{schema_name}.{relation_name}'. "
+                    f"Tables in {schema_name}: {', '.join(names)}"
+                )
             oid, rel, est, tsize, isize = row
 
             st = _colset(cur, """
@@ -81,22 +98,37 @@ def inspect_table(table_name: str) -> str:
                 FROM pg_stat_user_indexes i JOIN pg_index x ON x.indexrelid = i.indexrelid
                 WHERE i.relid = %s ORDER BY i.indexrelname""", (oid,))
             fk_out = _colset(cur, f"""
-                SELECT {_COLS}, rt.relname FROM pg_constraint c
+                SELECT {_COLS}, rn.nspname, rt.relname FROM pg_constraint c
                 JOIN pg_class rt ON rt.oid = c.confrelid
+                JOIN pg_namespace rn ON rn.oid = rt.relnamespace
                 WHERE c.conrelid = %s AND c.contype = 'f'""", (oid,))
-            fk_in = _colset(cur, f"""
-                SELECT t.relname, {_COLS} FROM pg_constraint c
+            incoming_scope = parse_database_tables(runtime.context.database_tables)
+            incoming_predicate = sql.SQL(" OR ").join(
+                sql.SQL("(n.nspname = %s AND t.relname = %s)")
+                for _ in incoming_scope
+            )
+            incoming_params = tuple(
+                part
+                for allowed_schema, allowed_table in incoming_scope
+                for part in (allowed_schema, allowed_table)
+            )
+            fk_in = _colset(cur, sql.SQL(f"""
+                SELECT n.nspname, t.relname, {_COLS} FROM pg_constraint c
                 JOIN pg_class t ON t.oid = c.conrelid
-                WHERE c.confrelid = %s AND c.contype = 'f'""", (oid,))
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE c.confrelid = %s AND c.contype = 'f' AND ({{}})""").format(
+                    incoming_predicate
+                ), (oid, *incoming_params))
             stats = _colset(cur, """
                 SELECT attname, n_distinct, null_frac FROM pg_stats
-                WHERE schemaname = 'public' AND tablename = %s ORDER BY attname""", (rel,))
+                WHERE schemaname = %s AND tablename = %s ORDER BY attname""",
+                (schema_name, rel))
             live = st[0][4] if st else 0
-            rows_text = _rows_text(cur, rel, live, est)
+            rows_text = _rows_text(cur, schema_name, rel, live, est)
     except Exception as e:
-        return f"ERROR inspecting table: {e}"
+        return f"ERROR inspecting table: {type(e).__name__}"
 
-    out = [f'Table "{rel}" -- {rows_text}, table {_bytes(tsize)}, indexes {_bytes(isize)}']
+    out = [f'Table "{schema_name}"."{rel}" -- {rows_text}, table {_bytes(tsize)}, indexes {_bytes(isize)}']
     if st:
         s = st[0]
         out.append(f"Access since stats reset: seq scans {s[0]:,} (read {s[1]:,} rows), "
@@ -111,9 +143,13 @@ def inspect_table(table_name: str) -> str:
     if not idx:
         out.append("  none")
     if fk_out:
-        out.append("Foreign keys: " + "; ".join(f"{c} -> {t}" for c, t in fk_out))
+        out.append("Foreign keys: " + "; ".join(
+            f"{c} -> {schema}.{table}" for c, schema, table in fk_out
+        ))
     if fk_in:
-        out.append("Referenced by: " + "; ".join(f"{t}.{c}" for t, c in fk_in))
+        out.append("Referenced by: " + "; ".join(
+            f"{schema}.{table}.{columns}" for schema, table, columns in fk_in
+        ))
     if stats:
         parts = []
         for name, nd, nf in stats[:16]:
@@ -131,7 +167,7 @@ def inspect_table(table_name: str) -> str:
 
 
 @tool
-def db_activity() -> str:
+def db_activity(runtime: ToolRuntime[DetectiveContext]) -> str:
     """
     Snapshot of database health in one call: connections in use vs
     max_connections, sessions by state (active / idle / idle in transaction),
@@ -141,7 +177,7 @@ def db_activity() -> str:
     Per-session detail from other users needs: GRANT pg_monitor TO <user>.
     """
     try:
-        with closing(_connect()) as conn, conn.cursor() as cur:
+        with closing(_connect(runtime)) as conn, conn.cursor() as cur:
             settings = dict(_colset(cur, """
                 SELECT name, setting || COALESCE(unit, '') FROM pg_settings WHERE name IN
                 ('max_connections', 'shared_buffers', 'work_mem', 'effective_cache_size',
@@ -164,7 +200,7 @@ def db_activity() -> str:
                 SELECT numbackends, xact_commit, xact_rollback, deadlocks, blks_hit, blks_read,
                        temp_files, temp_bytes FROM pg_stat_database WHERE datname = current_database()""", None)
     except Exception as e:
-        return f"ERROR reading activity: {e}"
+        return f"ERROR reading activity: {type(e).__name__}"
 
     out = [f"Connections: {total} client sessions open, max_connections = {settings.get('max_connections', '?')}"]
     hidden = sum(c for s, c, _ in by_state if s is None)
@@ -181,7 +217,7 @@ def db_activity() -> str:
     if slow:
         out.append("Longest running active queries: " + " | ".join(f"{a}s: {_short(q)}" for a, q in slow))
     if db:
-        nb, com, rb, dl, hit, rd, tf, tb = db[0]
+        _, com, rb, dl, hit, rd, tf, tb = db[0]
         ratio = f"{hit * 100 / (hit + rd):.1f}%" if (hit + rd) else "n/a"
         out.append(f"Database totals since stats reset: commits {com:,}, rollbacks {rb:,}, deadlocks {dl}, "
                    f"cache hit ratio {ratio}, temp files {tf} ({_bytes(tb)})")

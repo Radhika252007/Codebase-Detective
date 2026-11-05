@@ -1,14 +1,20 @@
 import time
 import requests
 from langchain_core.tools import tool
-from config import TARGET_BASE_URL, AUTH_TOKEN
+from langgraph.prebuilt import ToolRuntime
+from agent.runtime_context import DetectiveContext
+
 from agent.codebase_detective_tools.tools.route_tools import check_route
 
 _ALLOWED_METHODS = {"GET"}
 
 
 @tool
-def time_endpoint(path: str, method: str = "GET") -> str:
+def time_endpoint(
+    path: str,
+    runtime: ToolRuntime[DetectiveContext],
+    method: str = "GET",
+) -> str:
     """
     Measure how long a REAL endpoint on the target app takes to respond, in
     milliseconds. The path (e.g. '/api/tickets?userId=1') is validated
@@ -21,18 +27,26 @@ def time_endpoint(path: str, method: str = "GET") -> str:
     if method not in _ALLOWED_METHODS:
         return f"ERROR: only {_ALLOWED_METHODS} requests are allowed."
 
+    context = runtime.context
+    if context is None or not context.base_url:
+        return "ERROR: no per-investigation base URL is configured."
     if not path.startswith("/"):
         path = "/" + path
 
     try:
-        ok, info = check_route(path, method)
+        ok, info = check_route(
+            path,
+            method,
+            context.routes_manifest,
+            context.project_root,
+        )
     except FileNotFoundError as e:
         return f"ERROR: {e}"
     if not ok:
         return f"ERROR (not sent): {info}"
 
-    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
-    url = TARGET_BASE_URL.rstrip("/") + path
+    headers = {"Authorization": f"Bearer {context.auth_token}"} if context.auth_token else {}
+    url = context.base_url.rstrip("/") + path
     start = time.monotonic()
     try:
         response = requests.get(url, headers=headers, timeout=15)

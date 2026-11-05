@@ -1,39 +1,104 @@
-"""
-Manual sanity check for each tool, with NO LLM involved.
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-This is Milestone 1 from the project guide: "write the tools, test each
-without any LLM." Run this after filling in .env. Edit the table/SQL
-names below to match your actual Prisma models before running.
+import psycopg2
 
-    python test_tools.py
-"""
-from agent.codebase_detective_tools.tools import (
+from agent.codebase_detective_tools.tools import ALL_TOOLS
+from agent.codebase_detective_tools.tools.file_tools import (
     list_project_files,
     read_file,
-    search_code,
-    run_explain,
-    get_indexes,
-    time_endpoint,
 )
+from agent.codebase_detective_tools.tools.http_tools import time_endpoint
+from agent.codebase_detective_tools.tools.route_tools import list_api_routes
+from agent.codebase_detective_tools.tools.profile_tools import _snapshot
+from agent.runtime_context import DetectiveContext
 
-print("=== list_project_files ===")
-print(list_project_files.invoke({"relative_path": "."}))
 
-print("\n=== search_code ('findMany') ===")
-print(search_code.invoke({"pattern": "findMany"}))
+class RuntimeToolTests(unittest.TestCase):
+    def test_runtime_context_is_not_exposed_in_tool_call_schemas(self):
+        tools = [*ALL_TOOLS, list_project_files, time_endpoint, list_api_routes]
+        for tool in tools:
+            with self.subTest(tool=tool.name):
+                self.assertNotIn("runtime", tool.tool_call_schema.model_fields)
 
-# --- Edit these two to match a real table and a real, cheap query ---
-TABLE_NAME = "Booking"            # exact Postgres table name, case-sensitive
-SAMPLE_SQL = 'SELECT * FROM "Booking" LIMIT 10'
+    def test_file_tools_use_the_selected_project_root(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            Path(project_root, "source.txt").write_text("selected project", encoding="utf-8")
+            runtime = SimpleNamespace(
+                context=DetectiveContext(project_root=project_root),
+            )
 
-print(f"\n=== get_indexes('{TABLE_NAME}') ===")
-print(get_indexes.invoke({"table_name": TABLE_NAME}))
+            content = read_file.func("source.txt", runtime)
+            listing = list_project_files.func(runtime)
 
-print(f"\n=== run_explain ===")
-print(run_explain.invoke({"sql": SAMPLE_SQL}))
+        self.assertIn("selected project", content)
+        self.assertIn("source.txt", listing)
 
-print("\n=== time_endpoint('/bookings') ===")
-print(time_endpoint.invoke({"path": "/bookings"}))
+    def test_http_tool_uses_runtime_url_auth_and_routes_manifest(self):
+        response = SimpleNamespace(status_code=200, content=b"ok", text="")
+        with tempfile.TemporaryDirectory() as project_root:
+            manifest = Path(project_root, "routes.json")
+            manifest.write_text(
+                json.dumps([{"path": "/api/orders", "methods": ["GET"]}]),
+                encoding="utf-8",
+            )
+            runtime = SimpleNamespace(
+                context=DetectiveContext(
+                    project_root=project_root,
+                    base_url="https://target.example",
+                    auth_token="runtime-token",
+                    routes_manifest="routes.json",
+                )
+            )
 
-print("\nDone. Milestone 1 is complete once every section above returns")
-print("real output instead of an ERROR line.")
+            with patch("agent.codebase_detective_tools.tools.http_tools.requests.get",
+                       return_value=response) as get:
+                result = time_endpoint.func("/api/orders", runtime)
+
+        get.assert_called_once_with(
+            "https://target.example/api/orders",
+            headers={"Authorization": "Bearer runtime-token"},
+            timeout=15,
+        )
+        self.assertIn("status 200", result)
+
+    def test_optional_statistics_permission_failure_is_not_repeated(self):
+        connection = SimpleNamespace(
+            cursor=MagicMock(),
+            rollback=MagicMock(),
+            close=MagicMock(),
+        )
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = []
+        cursor.fetchone.return_value = ("public",)
+        cursor.execute.side_effect = [
+            None,
+            None,
+            psycopg2.errors.InsufficientPrivilege("permission denied"),
+            None,
+        ]
+        runtime = SimpleNamespace(
+            context=DetectiveContext(
+                database_tables=("app.users",),
+                database_capabilities={},
+            )
+        )
+
+        with patch(
+            "agent.codebase_detective_tools.tools.profile_tools._connect",
+            return_value=connection,
+        ):
+            _, _, first_note = _snapshot(runtime)
+            _, _, second_note = _snapshot(runtime)
+
+        self.assertIn("unreadable", first_note)
+        self.assertIn("unavailable", second_note)
+        self.assertEqual(cursor.execute.call_count, 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

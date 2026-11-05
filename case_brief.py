@@ -22,9 +22,9 @@ from pathlib import Path
 
 from psycopg2 import sql
 
-from config import PROJECT_ROOT, DATABASE_URL
+from config import PROJECT_ROOT
 from agent.codebase_detective_tools.tools.code_item_tools import SKIP_DIRS, JS_EXT
-from agent.codebase_detective_tools.tools.db_tools import _connect
+from agent.database_access import connect_read_only, parse_database_tables
 
 MAX_STACK_CHARS = 1200
 MAX_STRUCTURE_CHARS = 2500
@@ -59,10 +59,10 @@ TYPE_SHORT = {
 
 
 # ---------------------------------------------------------------- helpers
-def _scrub(e: Exception) -> str:
+def _scrub(e: Exception, database_url: str | None = None) -> str:
     msg = str(e).strip().replace("\n", " ")
-    if DATABASE_URL:
-        msg = msg.replace(DATABASE_URL, "<db-url>")
+    if database_url:
+        msg = msg.replace(database_url, "<db-url>")
     return f"{type(e).__name__}: {msg[:200]}"
 
 
@@ -87,8 +87,8 @@ def _fmt_rows(n: int, exact: bool) -> str:
 
 
 # ------------------------------------------------------------- tech stack
-def _stack() -> str:
-    root = Path(PROJECT_ROOT).resolve()
+def _stack(project_root: str = PROJECT_ROOT) -> str:
+    root = Path(project_root).resolve()
     pkg_path = root / "package.json"
     if not pkg_path.exists():
         return "No package.json at the project root (not a Node project, or code lives in a subfolder)."
@@ -119,8 +119,13 @@ def _stack() -> str:
 
 
 # ---------------------------------------------------------- source layout
-def _structure(max_dirs: int = 45, max_files: int = 10, max_depth: int = 5) -> str:
-    root = Path(PROJECT_ROOT).resolve()
+def _structure(
+    project_root: str = PROJECT_ROOT,
+    max_dirs: int = 45,
+    max_files: int = 10,
+    max_depth: int = 5,
+) -> str:
+    root = Path(project_root).resolve()
     lines = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
@@ -144,38 +149,39 @@ def _structure(max_dirs: int = 45, max_files: int = 10, max_depth: int = 5) -> s
 
 # ------------------------------------------------------- schema: live DB
 COLUMNS_SQL = """
-SELECT table_name, column_name, data_type
+SELECT table_schema, table_name, column_name, data_type
 FROM information_schema.columns
-WHERE table_schema = 'public' AND table_name <> '_prisma_migrations'
-ORDER BY table_name, ordinal_position
+WHERE {}
+ORDER BY table_schema, table_name, ordinal_position
 """
 # pg_catalog (not information_schema): information_schema hides constraints
 # from users that only have SELECT -- exactly what the read-only user has.
 CONSTRAINTS_SQL = """
-SELECT t.relname, c.contype::text,
+SELECT n.nspname, t.relname, c.contype::text,
        (SELECT array_agg(a.attname ORDER BY k.ord)
           FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum),
-       rt.relname
+       rn.nspname, rt.relname
 FROM pg_constraint c
 JOIN pg_class t ON t.oid = c.conrelid
 JOIN pg_namespace n ON n.oid = t.relnamespace
 LEFT JOIN pg_class rt ON rt.oid = c.confrelid
-WHERE n.nspname = 'public' AND c.contype IN ('p', 'f')
+LEFT JOIN pg_namespace rn ON rn.oid = rt.relnamespace
+WHERE {} AND c.contype IN ('p', 'f')
 """
 INDEXES_SQL = """
-SELECT t.relname, pg_get_indexdef(x.indexrelid), x.indisprimary, x.indisunique
+SELECT n.nspname, t.relname, pg_get_indexdef(x.indexrelid), x.indisprimary, x.indisunique
 FROM pg_index x
 JOIN pg_class t ON t.oid = x.indrelid
 JOIN pg_namespace n ON n.oid = t.relnamespace
-WHERE n.nspname = 'public'
-ORDER BY t.relname, x.indexrelid
+WHERE {}
+ORDER BY n.nspname, t.relname, x.indexrelid
 """
 TABLES_SQL = """
-SELECT c.relname, c.reltuples::bigint
+SELECT n.nspname, c.relname, c.reltuples::bigint
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relname <> '_prisma_migrations'
-ORDER BY c.relname
+WHERE {} AND c.relkind IN ('r', 'p') AND c.relname <> '_prisma_migrations'
+ORDER BY n.nspname, c.relname
 """
 
 
@@ -186,52 +192,82 @@ def _index_desc(indexdef: str, unique: bool) -> str:
     return ("unique" if unique else "") + f"({cols})" + (" partial" if " WHERE " in indexdef else "")
 
 
-def _schema_from_db() -> str:
-    with closing(_connect()) as conn, conn.cursor() as cur:
-        cur.execute(COLUMNS_SQL); cols = cur.fetchall()
-        cur.execute(CONSTRAINTS_SQL); cons = cur.fetchall()
-        cur.execute(INDEXES_SQL); idx = cur.fetchall()
-        cur.execute(TABLES_SQL); tables = cur.fetchall()[:MAX_TABLES]
+def _scope_predicate(schema_expression: str, table_expression: str, table_scope):
+    predicate = sql.SQL(" OR ").join(
+        sql.SQL("({} = %s AND {} = %s)").format(
+            sql.SQL(schema_expression),
+            sql.SQL(table_expression),
+        )
+        for _ in table_scope
+    )
+    params = tuple(part for schema_name, table_name in table_scope for part in (schema_name, table_name))
+    return predicate, params
+
+
+def _schema_from_db(database_url: str, database_tables: tuple[str, ...]) -> str:
+    table_scope = parse_database_tables(database_tables)
+    with closing(connect_read_only(database_url, database_tables)) as conn, conn.cursor() as cur:
+        columns_scope, columns_params = _scope_predicate("table_schema", "table_name", table_scope)
+        constraints_scope, constraints_params = _scope_predicate("n.nspname", "t.relname", table_scope)
+        indexes_scope, indexes_params = _scope_predicate("n.nspname", "t.relname", table_scope)
+        tables_scope, tables_params = _scope_predicate("n.nspname", "c.relname", table_scope)
+
+        cur.execute(sql.SQL(COLUMNS_SQL).format(columns_scope), columns_params); cols = cur.fetchall()
+        cur.execute(sql.SQL(CONSTRAINTS_SQL).format(constraints_scope), constraints_params); cons = cur.fetchall()
+        cur.execute(sql.SQL(INDEXES_SQL).format(indexes_scope), indexes_params); idx = cur.fetchall()
+        cur.execute(sql.SQL(TABLES_SQL).format(tables_scope), tables_params); tables = cur.fetchall()[:MAX_TABLES]
         counts = {}
-        for name, est in tables:
+        for schema_name, name, est in tables:
             if est > 0:
-                counts[name] = (est, False)
+                counts[(schema_name, name)] = (est, False)
             else:  # never analyzed (0 / -1): bounded exact count instead of a full scan
-                cur.execute(sql.SQL("SELECT count(*) FROM (SELECT 1 FROM {} LIMIT %s) s")
-                            .format(sql.Identifier(name)), (COUNT_CAP,))
-                counts[name] = (cur.fetchone()[0], True)
+                cur.execute(
+                    sql.SQL("SELECT count(*) FROM (SELECT 1 FROM {}.{} LIMIT %s) s").format(
+                        sql.Identifier(schema_name),
+                        sql.Identifier(name),
+                    ),
+                    (COUNT_CAP,),
+                )
+                counts[(schema_name, name)] = (cur.fetchone()[0], True)
 
     t_cols, pk, fk, t_idx = defaultdict(list), defaultdict(set), defaultdict(dict), defaultdict(list)
-    for t, c, typ in cols:
-        t_cols[t].append((c, TYPE_SHORT.get(typ, typ)))
-    for t, kind, names, ref in cons:
+    for schema_name, t, c, typ in cols:
+        t_cols[(schema_name, t)].append((c, TYPE_SHORT.get(typ, typ)))
+    for schema_name, t, kind, names, ref_schema, ref_table in cons:
+        table_key = (schema_name, t)
         for c in names or []:
             if kind == "p":
-                pk[t].add(c)
+                pk[table_key].add(c)
             else:
-                fk[t][c] = ref
-    for t, d, is_pk, is_uq in idx:
+                fk[table_key][c] = f"{ref_schema}.{ref_table}"
+    for schema_name, t, d, is_pk, is_uq in idx:
+        table_key = (schema_name, t)
         if not is_pk:
-            t_idx[t].append(_index_desc(d, is_uq))
+            t_idx[table_key].append(_index_desc(d, is_uq))
 
     out = []
-    for name, _ in tables:
+    for schema_name, name, _ in tables:
+        table_key = (schema_name, name)
         parts = []
-        for c, typ in t_cols[name][:MAX_COLS_PER_TABLE]:
-            mark = (" PK" if c in pk[name] else "") + (f" FK->{fk[name][c]}" if c in fk[name] else "")
+        for c, typ in t_cols[table_key][:MAX_COLS_PER_TABLE]:
+            mark = (" PK" if c in pk[table_key] else "") + (
+                f" FK->{fk[table_key][c]}" if c in fk[table_key] else ""
+            )
             parts.append(f"{c} {typ}{mark}")
-        more = len(t_cols[name]) - MAX_COLS_PER_TABLE
+        more = len(t_cols[table_key]) - MAX_COLS_PER_TABLE
         if more > 0:
             parts.append(f"+{more} more columns")
-        n, exact = counts[name]
-        out.append(f"{name} ({_fmt_rows(n, exact)} rows): {', '.join(parts)}\n"
-                   f"    indexes besides PK: {'; '.join(t_idx[name]) or 'none'}")
-    return "\n".join(out) if out else "(no tables in the public schema)"
+        n, exact = counts[table_key]
+        out.append(
+            f"{schema_name}.{name} ({_fmt_rows(n, exact)} rows): {', '.join(parts)}\n"
+            f"    indexes besides PK: {'; '.join(t_idx[table_key]) or 'none'}"
+        )
+    return "\n".join(out) if out else "(no tables in the configured allowlist)"
 
 
 # ------------------------------------------------- schema: schema.prisma
-def _schema_from_prisma() -> str:
-    root = Path(PROJECT_ROOT).resolve()
+def _schema_from_prisma(project_root: str = PROJECT_ROOT) -> str:
+    root = Path(project_root).resolve()
     path = None
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -269,27 +305,51 @@ def _schema_from_prisma() -> str:
     return "\n".join(out) if out else "(no models found in schema.prisma)"
 
 
-def _schema() -> str:
+def _schema(
+    project_root: str,
+    database_url: str | None,
+    database_tables: tuple[str, ...],
+) -> str:
+    if not database_url or not database_tables:
+        return "(source: schema.prisma; database inspection not configured)\n" + _schema_from_prisma(project_root)
+
     try:
-        return "(source: live database)\n" + _schema_from_db()
+        return "(source: live database)\n" + _schema_from_db(database_url, database_tables)
     except Exception as db_err:
-        reason = _scrub(db_err)
+        reason = _scrub(db_err, database_url)
         try:
             return (f"(source: schema.prisma -- live DB unavailable: {reason}; "
                     "no row counts, and declared indexes may differ from real ones)\n"
-                    + _schema_from_prisma())
+                    + _schema_from_prisma(project_root))
         except Exception as file_err:
-            return f"(unavailable: DB error: {reason}; schema.prisma: {_scrub(file_err)})"
+            return f"(unavailable: DB error: {reason}; schema.prisma: {_scrub(file_err, database_url)})"
 
 
 # ----------------------------------------------------------------- public
-def build_case_brief() -> str:
+def build_case_brief(
+    project_root: str | None = None,
+    database_url: str | None = None,
+    database_tables: tuple[str, ...] = (),
+) -> str:
     """Return the pre-investigation brief as one prompt-ready string."""
+    project_root = project_root or PROJECT_ROOT
     parts = [
         "# CASE BRIEF (auto-generated facts about the target project; contains no conclusions)",
-        _section("Tech stack (inferred from package.json)", _stack, MAX_STACK_CHARS),
-        _section("Source layout (directory: files)", _structure, MAX_STRUCTURE_CHARS),
-        _section("Database schema", _schema, MAX_SCHEMA_CHARS),
+        _section(
+            "Tech stack (inferred from package.json)",
+            lambda: _stack(project_root),
+            MAX_STACK_CHARS,
+        ),
+        _section(
+            "Source layout (directory: files)",
+            lambda: _structure(project_root),
+            MAX_STRUCTURE_CHARS,
+        ),
+        _section(
+            "Database schema",
+            lambda: _schema(project_root, database_url, database_tables),
+            MAX_SCHEMA_CHARS,
+        ),
         "Not included: API routes, logs, code. Explore with view_code_item "
         "(e.g. on the entry file) instead of guessing.",
     ]

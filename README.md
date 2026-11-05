@@ -27,8 +27,25 @@ The project runs a ReAct-style investigation loop using LangGraph. It gathers fa
 .
 ├── agent/
 │   ├── graph.py              # investigation workflow and routing
-│   ├── nodes.py              # agent actions and decision logic
-│   ├── state.py              # state schema for the investigation
+│   ├── nodes/                 # one module per graph node
+│   │   ├── __init__.py        # compatibility exports for agent.nodes imports
+│   │   ├── common.py          # shared settings, prompts, and output schemas
+│   │   ├── helpers.py         # evidence, history, and notebook helpers
+│   │   ├── can_conclude.py
+│   │   ├── choose_action.py
+│   │   ├── collect_configuration.py
+│   │   ├── configuration_confirmation.py
+│   │   ├── configuration_error.py
+│   │   ├── evaluate_result.py
+│   │   ├── generate_final_report.py
+│   │   ├── generate_hypotheses.py
+│   │   ├── prepare_case.py
+│   │   ├── reject_conclusion.py
+│   │   ├── request_db_setup.py
+│   │   ├── run_tools.py
+│   │   ├── validate_database.py
+│   │   └── validate_project.py
+│   ├── state.py               # state schema for the investigation
 │   └── codebase_detective_tools/
 │       ├── README.md         # tool descriptions and setup notes
 │       ├── tools/
@@ -61,7 +78,7 @@ The project runs a ReAct-style investigation loop using LangGraph. It gathers fa
 - Python 3.10+
 - Access to the target application codebase
 - A read-only PostgreSQL database user for the target app
-- Your app's project root and runtime URL configured in environment variables
+- A project root selected during initialization
 
 ## Setup
 
@@ -72,16 +89,23 @@ The project runs a ReAct-style investigation loop using LangGraph. It gathers fa
 pip install -r requirements.txt
 ```
 
-3. Configure the environment variables in `.env` (or export them in your shell). The project expects values like:
+3. Configure target-specific settings through a per-investigation `DetectiveContext`, not `.env`. A host application can call `investigate` with a context assembled from its secure credential store:
 
-```bash
-TARGET_PROJECT_ROOT=/path/to/target/project
-TARGET_DATABASE_URL=postgresql://detective_ro:password@host:5432/dbname
-TARGET_BASE_URL=http://localhost:3000
-TARGET_AUTH_TOKEN=optional-token
+```python
+from agent.graph import investigate
+from agent.runtime_context import DetectiveContext
+
+context = DetectiveContext(
+    database_url=secure_store.get("detective-database-url"),
+    database_tables=("app.bookings", "app.users"),
+    base_url="http://localhost:3000",
+    auth_token=secure_store.get("target-api-token"),
+    routes_manifest="routes.json",
+)
+state = investigate(question, runtime_context=context)
 ```
 
-`TARGET_PROJECT_ROOT` is the codebase the agent may inspect, and `TARGET_DATABASE_URL` should be a read-only database connection. This is intentional: the investigation should be non-destructive.
+The initialization flow asks for the project root and whether database inspection is wanted. `database_url` is only needed when inspection is enabled, and that mode requires an explicit, unique `schema.table` allowlist. Passwords and tokens remain in runtime context and are never placed in graph state, prompts, logs, or checkpoints. Use a dedicated, non-privileged read-only database role.
 
 ## Running an investigation
 
@@ -114,10 +138,13 @@ python run.py -f query.txt --save report.md
 The project is designed around a single investigation flow:
 
 1. A bug report or question is supplied.
-2. `case_brief.py` creates a compact factual summary of the project and schema.
-3. The LangGraph workflow runs through `prepare_case -> generate_hypotheses -> choose_action`.
-4. The agent calls code/database tools to inspect relevant files, endpoints, and query paths.
-5. Evidence is evaluated and either the investigation continues or a final report is generated.
+2. The graph asks for the project root and whether database inspection is needed.
+3. It validates the project directory and, if requested, database connectivity and read-only catalog access.
+4. It asks for explicit confirmation before starting the investigation.
+5. `case_brief.py` creates a compact factual summary; the graph then runs `prepare_case -> generate_hypotheses -> choose_action`.
+6. The agent gathers evidence, evaluates it, and continues the investigation or generates a final report.
+
+The initialization prompts use LangGraph `interrupt()` and must be answered by the caller before the workflow can continue. When resuming an interrupted investigation, supply the same secure runtime context again; LangGraph does not persist it in checkpoints.
 
 ## Understanding the environment and safety model
 

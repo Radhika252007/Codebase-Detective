@@ -1,17 +1,19 @@
 from pathlib import Path
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+from agent.runtime_context import DetectiveContext
 from config import PROJECT_ROOT, MAX_FILE_CHARS
 
 
-def _resolve_safe_path(relative_path: str) -> Path:
+def _resolve_safe_path(relative_path: str, project_root: str = PROJECT_ROOT) -> Path:
     """
     Resolve a path the agent gave us and make sure it can't escape
-    PROJECT_ROOT (e.g. via '../../etc/passwd'). This is the single most
+    project root (e.g. via '../../etc/passwd'). This is the single most
     important safety check in the whole tool set -- everything else here
     is about giving the LLM useful information; this is about not letting
     it read anything outside the sandbox.
     """
-    root = Path(PROJECT_ROOT).resolve()
+    root = Path(project_root).resolve()
     candidate = (root / relative_path).resolve()
     if root != candidate and root not in candidate.parents:
         raise ValueError(f"Path '{relative_path}' is outside the project root.")
@@ -19,7 +21,10 @@ def _resolve_safe_path(relative_path: str) -> Path:
 
 
 @tool
-def list_project_files(relative_path: str = ".") -> str:
+def list_project_files(
+    runtime: ToolRuntime[DetectiveContext],
+    relative_path: str = ".",
+) -> str:
     """
     List files and folders inside the target project, starting from
     relative_path (relative to the project root, e.g. '.' or 'src/routes').
@@ -28,7 +33,10 @@ def list_project_files(relative_path: str = ".") -> str:
     and build, since those are never useful to inspect.
     """
     try:
-        root = _resolve_safe_path(relative_path)
+        project_root = runtime.context.project_root if runtime.context else None
+        if not project_root:
+            return "ERROR: no per-investigation project root is configured."
+        root = _resolve_safe_path(relative_path, project_root)
     except ValueError as e:
         return f"ERROR: {e}"
 
@@ -59,7 +67,12 @@ def list_project_files(relative_path: str = ".") -> str:
 
 
 @tool
-def read_file(relative_path: str, start_line: int = 1, end_line: int | None = None) -> str:
+def read_file(
+    relative_path: str,
+    runtime: ToolRuntime[DetectiveContext],
+    start_line: int = 1,
+    end_line: int | None = None,
+) -> str:
     """
     Read a file from the target project, given a path relative to the
     project root (e.g. 'src/routes/orders.js'). Optionally pass start_line
@@ -68,7 +81,10 @@ def read_file(relative_path: str, start_line: int = 1, end_line: int | None = No
     rough location, then read just that slice instead of the whole file.
     """
     try:
-        path = _resolve_safe_path(relative_path)
+        project_root = runtime.context.project_root if runtime.context else None
+        if not project_root:
+            return "ERROR: no per-investigation project root is configured."
+        path = _resolve_safe_path(relative_path, project_root)
     except ValueError as e:
         return f"ERROR: {e}"
 

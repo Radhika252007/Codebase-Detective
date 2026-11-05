@@ -10,13 +10,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Absolute path to the root of the project the agent is allowed to inspect.
-# Every file tool checks paths against this and refuses anything outside it.
-PROJECT_ROOT = os.environ["TARGET_PROJECT_ROOT"]
+# Legacy defaults remain for tools that have not yet moved to runtime context.
+PROJECT_ROOT = os.environ.get("TARGET_PROJECT_ROOT", os.getcwd())
 
-# Connection string for a READ-ONLY Postgres user. See README.md for why
-# this must not be your app's normal (read-write) connection string.
-DATABASE_URL = os.environ["TARGET_DATABASE_URL"]
+# Runtime database validation should receive its connection through
+# DetectiveContext; keep this optional for legacy tool callers.
+DATABASE_URL = os.environ.get("TARGET_DATABASE_URL")
 
 # Base URL of the target app's running server, used by time_endpoint.
 TARGET_BASE_URL = os.environ.get("TARGET_BASE_URL", "http://localhost:3000")

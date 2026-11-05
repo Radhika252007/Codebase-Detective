@@ -2,7 +2,9 @@ import os
 import re
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 
+from agent.runtime_context import DetectiveContext
 from agent.codebase_detective_tools.tools.code_item_tools import (JS_EXT, _files, _find_end, _is_test_path, _lines, reset_caches)
 
 MAX_ENTRIES = 40
@@ -162,7 +164,11 @@ def _describe_raw(rest: str, col: int) -> str:
 
 
 @tool
-def scan_db_calls(path_hint: str = "", model: str = "") -> str:
+def scan_db_calls(
+    runtime: ToolRuntime[DetectiveContext],
+    path_hint: str = "",
+    model: str = "",
+) -> str:
     """
     List every database call in the codebase (or one area of it) in a single
     call: file:line, enclosing function, Prisma model.method (or raw SQL),
@@ -172,11 +178,14 @@ def scan_db_calls(path_hint: str = "", model: str = "") -> str:
     client calls and raw SQL via $queryRaw / pool.query / db.query. Filter with
     path_hint (e.g. 'orders') and/or model (e.g. 'order'). Test files skipped.
     """
+    project_root = runtime.context.project_root if runtime.context else None
+    if not project_root:
+        return "ERROR: no per-investigation project root is configured."
     reset_caches()
     hint = path_hint.lower().replace("\\", "/")
     model_f = model.lower()
     entries = []
-    for rel, ext in _files():
+    for rel, ext in _files(project_root):
         if ext not in JS_EXT:
             continue
         relp = rel.replace(os.sep, "/")
@@ -184,7 +193,7 @@ def scan_db_calls(path_hint: str = "", model: str = "") -> str:
             continue
         if _is_test_path(rel) and "test" not in hint:
             continue
-        lines = _lines(rel)
+        lines = _lines(rel, project_root)
         for idx, line in enumerate(lines):
             s = line.lstrip()
             if s.startswith("//") or s.startswith("*") or s.startswith("/*"):
@@ -211,7 +220,7 @@ def scan_db_calls(path_hint: str = "", model: str = "") -> str:
     out, in_loop, unbounded = [], 0, 0
     cur_file = None
     for relp, idx, col, call, desc in entries[:MAX_ENTRIES]:
-        lines = _lines(relp.replace("/", os.sep))
+        lines = _lines(relp.replace("/", os.sep), project_root)
         fn, fstart = _enclosing(lines, idx)
         loop = _loop_context(lines, idx, col, fstart)
         if loop:

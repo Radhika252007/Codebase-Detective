@@ -1,13 +1,15 @@
-import os
 import statistics
 import time
 from contextlib import closing
 
 import requests
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+import psycopg2
 from psycopg2 import sql
 
-from config import TARGET_BASE_URL, AUTH_TOKEN
+from agent.database_access import parse_database_tables
+from agent.runtime_context import DetectiveContext
 from .db_tools import _connect
 from .route_tools import check_route
 
@@ -16,22 +18,41 @@ STATS_WAIT = 11.0          # Postgres publishes table counters from an idle back
 
 
 def _err(e: Exception) -> str:
-    return f"{type(e).__name__}: {' '.join(str(e).split())[:160]}"
+    return type(e).__name__
 
 
-def _snapshot():
+def _snapshot(runtime: ToolRuntime[DetectiveContext]):
     """(per-table counters, per-statement counters or None, note)."""
-    with closing(_connect()) as conn:
+    allowed_tables = runtime.context.database_tables
+    table_scope = parse_database_tables(allowed_tables)
+    with closing(_connect(runtime)) as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT relname, seq_scan, seq_tup_read,
+            scope_predicate = sql.SQL(" OR ").join(
+                sql.SQL("(schemaname = %s AND relname = %s)")
+                for _ in table_scope
+            )
+            scope_params = tuple(
+                part
+                for schema_name, table_name in table_scope
+                for part in (schema_name, table_name)
+            )
+            cur.execute(sql.SQL("""SELECT schemaname, relname, seq_scan, seq_tup_read,
                                   COALESCE(idx_scan, 0), COALESCE(idx_tup_fetch, 0)
-                           FROM pg_stat_user_tables""")
-            tables = {r[0]: tuple(int(x or 0) for x in r[1:]) for r in cur.fetchall()}
+                           FROM pg_stat_user_tables WHERE {}""").format(scope_predicate),
+                        scope_params)
+            tables = {
+                f"{r[0]}.{r[1]}": tuple(int(x or 0) for x in r[2:])
+                for r in cur.fetchall()
+            }
+            capabilities = runtime.context.database_capabilities
+            if capabilities.get("pg_stat_statements") is False:
+                return tables, None, "pg_stat_statements is unavailable for this investigation"
             cur.execute("""SELECT n.nspname FROM pg_extension e
                            JOIN pg_namespace n ON n.oid = e.extnamespace
                            WHERE e.extname = 'pg_stat_statements'""")
             ext = cur.fetchone()
             if not ext:
+                capabilities["pg_stat_statements"] = False
                 return tables, None, "pg_stat_statements is not installed"
             schema = ext[0]          # 'public' locally, usually 'extensions' on Supabase
             try:
@@ -43,10 +64,14 @@ def _snapshot():
                 rows = cur.fetchall()
             except Exception as e:
                 conn.rollback()
+                if isinstance(e, psycopg2.errors.InsufficientPrivilege):
+                    capabilities["pg_stat_statements"] = False
                 return tables, None, (f"pg_stat_statements unreadable ({type(e).__name__}); try: "
                                       f"GRANT USAGE ON SCHEMA {schema} TO <this db user>")
             if any(r[0] is None for r in rows):
+                capabilities["pg_stat_statements"] = False
                 return tables, None, "pg_stat_statements hides other users' queries (GRANT pg_monitor TO <this db user>)"
+            capabilities["pg_stat_statements"] = True
             return tables, {r[0]: (int(r[1]), float(r[2]), r[3]) for r in rows}, None
 
 
@@ -98,7 +123,7 @@ def _bad_status(path, r) -> str:
     body = " ".join(r.text.split())[:200]
     hint = ""
     if r.status_code in (401, 403):
-        hint = " The endpoint needs authentication: set TARGET_AUTH_TOKEN."
+        hint = " The endpoint needs authentication: configure the runtime auth token."
     elif r.status_code == 404 and "Cannot GET" in r.text:
         hint = (" Express has no route for this path (wrong path or mount prefix such as /api); "
                 "read the entry file (named in the case brief) with read_file to find the mount prefix.")
@@ -108,7 +133,11 @@ def _bad_status(path, r) -> str:
 
 
 @tool
-def profile_endpoint(path: str, runs: int = 5) -> str:
+def profile_endpoint(
+    path: str,
+    runtime: ToolRuntime[DetectiveContext],
+    runs: int = 5,
+) -> str:
     """
     Profile one GET endpoint end to end in a single call. Sends one warmup
     request, then `runs` measured requests (max 10) and reports: latency
@@ -122,16 +151,23 @@ def profile_endpoint(path: str, runs: int = 5) -> str:
     runs = max(1, min(int(runs), MAX_RUNS))
     if not path.startswith("/"):
         path = "/" + path
-    if os.environ.get("TARGET_ROUTES_MANIFEST"):          # optional strict route check
-        try:
-            ok, info = check_route(path, "GET")
-            if not ok:
-                return f"ERROR (not sent): {info}"
-        except FileNotFoundError:
-            pass
+    context = runtime.context
+    if not context.base_url:
+        return "ERROR: no per-investigation base URL is configured."
+    try:
+        ok, info = check_route(
+            path,
+            "GET",
+            context.routes_manifest,
+            context.project_root,
+        )
+    except FileNotFoundError as e:
+        return f"ERROR: {e}"
+    if not ok:
+        return f"ERROR (not sent): {info}"
 
-    url = TARGET_BASE_URL.rstrip("/") + path
-    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
+    url = context.base_url.rstrip("/") + path
+    headers = {"Authorization": f"Bearer {context.auth_token}"} if context.auth_token else {}
     session = requests.Session()
 
     def hit():
@@ -141,7 +177,7 @@ def profile_endpoint(path: str, runs: int = 5) -> str:
 
     before, db_note = None, None
     try:
-        before = _snapshot()      # BEFORE the warmup, so its late-published counters land inside the window
+        before = _snapshot(runtime)      # BEFORE the warmup, so its late-published counters land inside the window
     except Exception as e:
         db_note = f"database counters unavailable ({_err(e)})"
 
@@ -165,7 +201,7 @@ def profile_endpoint(path: str, runs: int = 5) -> str:
     if before is not None:
         time.sleep(STATS_WAIT)
         try:
-            delta_text = _format_db_delta(before, _snapshot(), runs + 1)   # warmup + measured requests
+            delta_text = _format_db_delta(before, _snapshot(runtime), runs + 1)   # warmup + measured requests
         except Exception as e:
             delta_text = f"database counters unavailable ({_err(e)})"
 

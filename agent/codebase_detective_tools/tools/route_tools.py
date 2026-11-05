@@ -5,14 +5,22 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from langchain_core.tools import tool
-from config import ROUTES_MANIFEST
+from langgraph.prebuilt import ToolRuntime
+from agent.runtime_context import DetectiveContext
 
 
-def load_routes() -> list[dict]:
-    path = Path(ROUTES_MANIFEST)
+def load_routes(routes_manifest: str | None, project_root: str | None) -> list[dict]:
+    if not routes_manifest:
+        raise FileNotFoundError("No routes manifest is configured for this investigation.")
+    path = Path(routes_manifest)
+    if not path.is_absolute():
+        if not project_root:
+            raise FileNotFoundError("No project root is configured for this investigation.")
+        path = Path(project_root) / path
+    path = path.resolve()
     if not path.exists():
         raise FileNotFoundError(
-            f"Routes manifest not found at {ROUTES_MANIFEST}. "
+            f"Routes manifest not found at {path}. "
             "Generate it with scripts/dump_routes.js (see README)."
         )
     data = json.loads(path.read_text())
@@ -25,9 +33,14 @@ def _to_regex(route_path: str) -> re.Pattern:
     return re.compile(f"^{body}/?$")
 
 
-def check_route(path: str, method: str = "GET") -> tuple[bool, str]:
+def check_route(
+    path: str,
+    method: str = "GET",
+    routes_manifest: str | None = None,
+    project_root: str | None = None,
+) -> tuple[bool, str]:
     """Return (is_valid, message). Ignores the query string when matching."""
-    routes = load_routes()
+    routes = load_routes(routes_manifest, project_root)
     clean = urlparse(path).path
     for r in routes:
         if _to_regex(r["path"]).match(clean):
@@ -44,7 +57,7 @@ def check_route(path: str, method: str = "GET") -> tuple[bool, str]:
 
 
 @tool
-def list_api_routes() -> str:
+def list_api_routes(runtime: ToolRuntime[DetectiveContext]) -> str:
     """
     List every API route the target backend actually registers, with its
     HTTP methods (e.g. 'GET /api/tickets', 'GET /api/tickets/:id'). Call
@@ -52,7 +65,11 @@ def list_api_routes() -> str:
     Path parameters like ':id' must be replaced with real values.
     """
     try:
-        routes = load_routes()
+        context = runtime.context
+        routes = load_routes(
+            context.routes_manifest if context else None,
+            context.project_root if context else None,
+        )
     except FileNotFoundError as e:
         return f"ERROR: {e}"
     lines = [f"{', '.join(sorted(r['methods']))} {r['path']}" for r in routes]
